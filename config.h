@@ -1,7 +1,7 @@
 /* See LICENSE file for copyright and license details. */
 
 /* appearance */
-static char* font         = "JetBrainsMonoNF:size=12:style=bold";
+static char* font         = "JetBrainsMonoNF:size=8:style=bold";
 static char* normbgcolor  = "#222222";
 static char* normfgcolor  = "#cccccc";
 static char* selbgcolor   = "#555555";
@@ -70,7 +70,7 @@ static const Key keys[] = {
 	{ ALT|CTRL,          XK_l,      movetab,     { .i = +1 } },
 	{ ALT|CTRL,          XK_h,      movetab,     { .i = -1 } },
 
-	{ ALT,               XK_x,      killclient,  { 0 } },
+	{ ALT,               XK_q,      killclient,  { 0 } },
 	
 	{ ALT,               XK_Return, spawn,       SETPROP("_TABBED_SELECT_TAB") },
 	{ ALT,               XK_1,      move,        { .i = 0 } },
