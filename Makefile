@@ -1,7 +1,7 @@
 .POSIX:
 
 NAME = tabbed
-VERSION = 0.8
+VERSION = 0.7
 
 # paths
 PREFIX = /usr/local
@@ -11,7 +11,7 @@ DOCPREFIX = ${PREFIX}/share/doc/${NAME}
 # use system flags.
 TABBED_CFLAGS = -I/usr/X11R6/include -I/usr/include/freetype2 ${CFLAGS}
 TABBED_LDFLAGS = -L/usr/X11R6/lib -lX11 -lfontconfig -lXft ${LDFLAGS}
-TABBED_CPPFLAGS = -DVERSION=\"${VERSION}\" -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=700L
+TABBED_CPPFLAGS = -DVERSION=\"${VERSION}\" -D_DEFAULT_SOURCE
 
 # OpenBSD (uncomment)
 #TABBED_CFLAGS = -I/usr/X11R6/include -I/usr/X11R6/include/freetype2 ${CFLAGS}
@@ -20,7 +20,7 @@ SRC = tabbed.c xembed.c
 OBJ = ${SRC:.c=.o}
 BIN = ${OBJ:.o=}
 MAN1 = ${BIN:=.1}
-HDR = arg.h config.def.h
+HDR = arg.h icon.h config.def.h
 DOC = LICENSE README
 
 all: ${BIN}

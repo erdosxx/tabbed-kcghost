@@ -10,15 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <linux/limits.h>
 #include <X11/Xatom.h>
-#include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
+#include <X11/Xresource.h>
 #include <X11/Xutil.h>
 #include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
 
 #include "arg.h"
+#include "icon.h"
 
 /* XEMBED messages */
 #define XEMBED_EMBEDDED_NOTIFY          0
@@ -50,7 +52,7 @@
 
 enum { ColFG, ColBG, ColLast };       /* color */
 enum { WMProtocols, WMDelete, WMName, WMState, WMFullscreen,
-       XEmbed, WMSelectTab, WMLast }; /* default atoms */
+       XEmbed, WMSelectTab, WMIcon, WMLast }; /* default atoms */
 
 typedef union {
 	int i;
@@ -85,12 +87,29 @@ typedef struct {
 	int tabx;
 	Bool urgent;
 	Bool closed;
+	pid_t pid;
 } Client;
+ 
+/* Xresources preferences */
+enum resource_type {
+	STRING = 0,
+	INTEGER = 1,
+	FLOAT = 2
+};
+
+typedef struct {
+	char *name;
+	enum resource_type type;
+	void *dst;
+} ResourcePref;
+ 
 
 /* function declarations */
 static void buttonpress(const XEvent *e);
+static void motionnotify(const XEvent *e);
 static void cleanup(void);
 static void clientmessage(const XEvent *e);
+static void config_init(void);
 static void configurenotify(const XEvent *e);
 static void configurerequest(const XEvent *e);
 static void createnotify(const XEvent *e);
@@ -110,7 +129,7 @@ static char *getatom(int a);
 static int getclient(Window w);
 static XftColor getcolor(const char *colstr);
 static int getfirsttab(void);
-static Bool gettextprop(Window w, Atom atom, char *text, unsigned int size);
+static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void initfont(const char *fontstr);
 static Bool isprotodel(int c);
 static void keypress(const XEvent *e);
@@ -121,11 +140,13 @@ static void move(const Arg *arg);
 static void movetab(const Arg *arg);
 static void propertynotify(const XEvent *e);
 static void resize(int c, int w, int h);
+static int resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst);
 static void rotate(const Arg *arg);
 static void run(void);
 static void sendxembed(int c, long msg, long detail, long d1, long d2);
 static void setcmd(int argc, char *argv[], int);
 static void setup(void);
+static void sigchld(int unused);
 static void spawn(const Arg *arg);
 static int textnw(const char *text, unsigned int len);
 static void toggle(const Arg *arg);
@@ -135,6 +156,7 @@ static void updatenumlockmask(void);
 static void updatetitle(int c);
 static int xerror(Display *dpy, XErrorEvent *ee);
 static void xsettitle(Window w, const char *str);
+static void xseticon(void);
 
 /* variables */
 static int screen;
@@ -151,6 +173,7 @@ static void (*handler[LASTEvent]) (const XEvent *) = {
 	[KeyPress] = keypress,
 	[MapRequest] = maprequest,
 	[PropertyNotify] = propertynotify,
+	[MotionNotify] = motionnotify,
 };
 static int bh, obh, wx, wy, ww, wh;
 static unsigned int numlockmask;
@@ -168,12 +191,57 @@ static int cmd_append_pos;
 static char winid[64];
 static char **cmd;
 static char *wmname = "tabbed";
+static pid_t nextpid;
 static const char *geometry;
+static unsigned long icon[ICON_WIDTH * ICON_HEIGHT + 2];
 
 char *argv0;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+// Given a pid, return its cwd to buf
+int getpidcwd(pid_t pid, char* buf, size_t bufsiz) {
+	static const int proc_max = 20; // '/proc/4194304/cwd'
+	int sn_ret;
+	ssize_t rl_ret;
+	char path[proc_max];
+
+	sn_ret = snprintf(path, proc_max, "/proc/%d/cwd", pid);
+	if(sn_ret < 0 || sn_ret >= proc_max)
+		return -1;
+
+	rl_ret = readlink(path, buf, bufsiz);
+	if(rl_ret < 0 || rl_ret == bufsiz)
+		return -1;
+
+	buf[rl_ret] = 0;
+	return 0;
+}
+
+// Given a pid, return a reasonable guess at its child pid
+pid_t getchildpid(pid_t pid) {
+	// '/proc/4194304/task/4194304/children'
+	static const int proc_max = 40;
+	int sn_ret;
+	char path[proc_max];
+	FILE* f;
+
+	// guessing tid == pid
+	sn_ret = snprintf(path, proc_max, "/proc/%d/task/%d/children", pid, pid);
+	if (sn_ret < 0 || sn_ret >= proc_max)
+		return -1;
+
+	f = fopen(path, "r");
+	if(f == NULL)
+		return -1;
+
+	// guess first child
+	if(fscanf(f, "%d ", &pid) != 1)
+		return -1;
+
+	return pid;
+}
 
 void
 buttonpress(const XEvent *e)
@@ -195,6 +263,7 @@ buttonpress(const XEvent *e)
 				focus(i);
 				break;
 			case Button2:
+			case Button3:
 				focus(i);
 				killclient(NULL);
 				break;
@@ -210,15 +279,48 @@ buttonpress(const XEvent *e)
 }
 
 void
+motionnotify(const XEvent *e)
+{
+	const XMotionEvent *ev = &e->xmotion;
+	int i, fc;
+	Arg arg;
+
+	if (ev->y < 0 || ev->y > bh)
+		return;
+
+	if (! (ev->state & Button1Mask)) {
+		return;
+	}
+
+	if (((fc = getfirsttab()) > 0 && ev->x < TEXTW(before)) || ev->x < 0)
+		return;
+
+	if (sel < 0)
+		return;
+
+	for (i = fc; i < nclients; i++) {
+		if (clients[i]->tabx > ev->x) {
+			if (i == sel+1) {
+				arg.i = 1;
+				movetab(&arg);
+			}
+			if (i == sel-1) {
+				arg.i = -1;
+				movetab(&arg);
+			}
+			break;
+		}
+	}
+}
+
+void
 cleanup(void)
 {
 	int i;
 
 	for (i = 0; i < nclients; i++) {
-		focus(i);
-		killclient(NULL);
-		XReparentWindow(dpy, clients[i]->win, root, 0, 0);
-		unmanage(i);
+		kill(clients[i]->pid, SIGTERM);
+		free(clients[i]);
 	}
 	free(clients);
 	clients = NULL;
@@ -243,6 +345,23 @@ clientmessage(const XEvent *e)
 		}
 		running = False;
 	}
+}
+
+void
+config_init(void)
+{
+	char *resm;
+	XrmDatabase db;
+	ResourcePref *p;
+
+	XrmInitialize();
+	resm = XResourceManagerString(dpy);
+	if (!resm)
+		return;
+
+	db = XrmGetStringDatabase(resm);
+	for (p = resources; p < resources + LENGTH(resources); p++)
+		resource_load(db, p->name, p->type, p->dst);
 }
 
 void
@@ -363,7 +482,6 @@ drawbar(void)
 		dc.w = width / cc;
 		if (c == sel) {
 			col = dc.sel;
-			dc.w += width % cc;
 		} else {
 			col = clients[c]->urgent ? dc.urg : dc.norm;
 		}
@@ -381,10 +499,16 @@ drawtext(const char *text, XftColor col[ColLast])
 	int i, j, x, y, h, len, olen;
 	char buf[256];
 	XftDraw *d;
-	XRectangle r = { dc.x, dc.y, dc.w, dc.h };
+	XRectangle tab = { dc.x+separator, dc.y, dc.w-separator, dc.h };
+	XRectangle sep = { dc.x, dc.y, separator, dc.h };
 
+	if (separator) {
+		XSetForeground(dpy, dc.gc, col[ColFG].pixel);
+		XFillRectangles(dpy, dc.drawable, dc.gc, &sep, 1);
+	}
 	XSetForeground(dpy, dc.gc, col[ColBG].pixel);
-	XFillRectangles(dpy, dc.drawable, dc.gc, &r, 1);
+	XFillRectangles(dpy, dc.drawable, dc.gc, &tab, 1);
+
 	if (!text)
 		return;
 
@@ -455,6 +579,8 @@ focus(int c)
 			n += snprintf(&buf[n], sizeof(buf) - n, " %s", cmd[i]);
 
 		xsettitle(win, buf);
+		XChangeProperty(dpy, win, wmatom[WMIcon], XA_CARDINAL, 32,
+		                PropModeReplace, (unsigned char *) icon, ICON_WIDTH * ICON_HEIGHT + 2);
 		XRaiseWindow(dpy, win);
 
 		return;
@@ -474,6 +600,7 @@ focus(int c)
 		lastsel = sel;
 		sel = c;
 	}
+	xseticon();
 
 	if (clients[c]->urgent && (wmh = XGetWMHints(dpy, clients[c]->win))) {
 		wmh->flags &= ~XUrgencyHint;
@@ -599,32 +726,27 @@ getfirsttab(void)
 	       ret;
 }
 
-Bool
+int
 gettextprop(Window w, Atom atom, char *text, unsigned int size)
 {
-	char **list = NULL;
-	int n;
-	XTextProperty name;
+    char **list = NULL;
+    int n;
+    XTextProperty name;
 
-	if (!text || size == 0)
-		return False;
-
-	text[0] = '\0';
-	XGetTextProperty(dpy, w, &name, atom);
-	if (!name.nitems)
-		return False;
-
-	if (name.encoding == XA_STRING) {
-		strncpy(text, (char *)name.value, size - 1);
-	} else if (XmbTextPropertyToTextList(dpy, &name, &list, &n) >= Success
-	           && n > 0 && *list) {
-		strncpy(text, *list, size - 1);
-		XFreeStringList(list);
-	}
-	text[size - 1] = '\0';
-	XFree(name.value);
-
-	return True;
+    if (!text || size == 0)
+        return 0;
+    text[0] = '\0';
+    if (!XGetTextProperty(dpy, w, &name, atom) || !name.nitems)
+        return 0;
+    if (name.encoding == XA_STRING) {
+        strncpy(text, (char *)name.value, size - 1);
+    } else if (XmbTextPropertyToTextList(dpy, &name, &list, &n) >= Success && n > 0 && *list) {
+        strncpy(text, *list, size - 1);
+        XFreeStringList(list);
+    }
+    text[size - 1] = '\0';
+    XFree(name.value);
+    return 1;
 }
 
 void
@@ -676,23 +798,10 @@ keypress(const XEvent *e)
 void
 killclient(const Arg *arg)
 {
-	XEvent ev;
-
 	if (sel < 0)
 		return;
 
-	if (isprotodel(sel) && !clients[sel]->closed) {
-		ev.type = ClientMessage;
-		ev.xclient.window = clients[sel]->win;
-		ev.xclient.message_type = wmatom[WMProtocols];
-		ev.xclient.format = 32;
-		ev.xclient.data.l[0] = wmatom[WMDelete];
-		ev.xclient.data.l[1] = CurrentTime;
-		XSendEvent(dpy, clients[sel]->win, False, NoEventMask, &ev);
-		clients[sel]->closed = True;
-	} else {
-		XKillClient(dpy, clients[sel]->win);
-	}
+	kill(clients[sel]->pid, SIGTERM);
 }
 
 void
@@ -725,6 +834,7 @@ manage(Window w)
 
 		c = ecalloc(1, sizeof *c);
 		c->win = w;
+		c->pid = nextpid;
 
 		nclients++;
 		clients = erealloc(clients, sizeof(Client *) * nclients);
@@ -771,7 +881,7 @@ manage(Window w)
 		focus(nextfocus ? nextpos :
 		      sel < 0 ? 0 :
 		      sel);
-		nextfocus = foreground;
+		nextfocus = focusnew;
 	}
 }
 
@@ -868,9 +978,13 @@ propertynotify(const XEvent *e)
 			}
 		}
 		XFree(wmh);
+		if (c == sel)
+			xseticon();
 	} else if (ev->state != PropertyDelete && ev->atom == XA_WM_NAME &&
 	           (c = getclient(ev->window)) > -1) {
 		updatetitle(c);
+	} else if (ev->atom == wmatom[WMIcon] && (c = getclient(ev->window)) > -1 && c == sel) {
+		xseticon();
 	}
 }
 
@@ -895,6 +1009,40 @@ resize(int c, int w, int h)
 	XConfigureWindow(dpy, clients[c]->win, CWY | CWWidth | CWHeight, &wc);
 	XSendEvent(dpy, clients[c]->win, False, StructureNotifyMask,
 	           (XEvent *)&ce);
+}
+
+int
+resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst)
+{
+	char **sdst = dst;
+	int *idst = dst;
+	float *fdst = dst;
+
+	char fullname[256];
+	char fullclass[256];
+	char *type;
+	XrmValue ret;
+
+	snprintf(fullname, sizeof(fullname), "%s.%s", "tabbed", name);
+	snprintf(fullclass, sizeof(fullclass), "%s.%s", "tabbed", name);
+	fullname[sizeof(fullname) - 1] = fullclass[sizeof(fullclass) - 1] = '\0';
+
+	XrmGetResource(db, fullname, fullclass, &type, &ret);
+	if (ret.addr == NULL || strncmp("String", type, 64))
+		return 1;
+
+	switch (rtype) {
+	case STRING:
+		*sdst = ret.addr;
+		break;
+	case INTEGER:
+		*idst = strtoul(ret.addr, NULL, 10);
+		break;
+	case FLOAT:
+		*fdst = strtof(ret.addr, NULL);
+		break;
+	}
+	return 0;
 }
 
 void
@@ -976,16 +1124,9 @@ setup(void)
 	XWMHints *wmh;
 	XClassHint class_hint;
 	XSizeHints *size_hint;
-	struct sigaction sa;
 
-	/* do not transform children into zombies when they terminate */
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_RESTART;
-	sa.sa_handler = SIG_IGN;
-	sigaction(SIGCHLD, &sa, NULL);
-
-	/* clean up any zombies that might have been inherited */
-	while (waitpid(-1, NULL, WNOHANG) > 0);
+	/* clean up any zombies immediately */
+	sigchld(0);
 
 	/* init screen */
 	screen = DefaultScreen(dpy);
@@ -1002,6 +1143,7 @@ setup(void)
 	wmatom[WMSelectTab] = XInternAtom(dpy, "_TABBED_SELECT_TAB", False);
 	wmatom[WMState] = XInternAtom(dpy, "_NET_WM_STATE", False);
 	wmatom[XEmbed] = XInternAtom(dpy, "_XEMBED", False);
+	wmatom[WMIcon] = XInternAtom(dpy, "_NET_WM_ICON", False);
 
 	/* init appearance */
 	wx = 0;
@@ -1053,7 +1195,7 @@ setup(void)
 	XSelectInput(dpy, win, SubstructureNotifyMask | FocusChangeMask |
 	             ButtonPressMask | ExposureMask | KeyPressMask |
 	             PropertyChangeMask | StructureNotifyMask |
-	             SubstructureRedirectMask);
+	             SubstructureRedirectMask | ButtonMotionMask);
 	xerrorxlib = XSetErrorHandler(xerror);
 
 	class_hint.res_name = wmname;
@@ -1081,26 +1223,44 @@ setup(void)
 	snprintf(winid, sizeof(winid), "%lu", win);
 	setenv("XEMBED", winid, 1);
 
-	nextfocus = foreground;
+	/* change icon from RGBA to ARGB */
+	icon[0] = ICON_WIDTH;
+	icon[1] =  ICON_HEIGHT;
+	for (int i = 0; i < ICON_WIDTH * ICON_HEIGHT; ++i) {
+		icon[i + 2] =
+		    ICON_PIXEL_DATA[i * 4 + 3] << 24 |
+		    ICON_PIXEL_DATA[i * 4 + 0] <<  0 |
+		    ICON_PIXEL_DATA[i * 4 + 1] <<  8 |
+		    ICON_PIXEL_DATA[i * 4 + 2] << 16 ;
+	}
+
+	nextfocus = focusnew;
 	focus(-1);
+}
+
+void
+sigchld(int unused)
+{
+	if (signal(SIGCHLD, sigchld) == SIG_ERR)
+		die("%s: cannot install SIGCHLD handler", argv0);
+
+	while (0 < waitpid(-1, NULL, WNOHANG));
 }
 
 void
 spawn(const Arg *arg)
 {
-	struct sigaction sa;
+	char sel_cwd[PATH_MAX];
 
-	if (fork() == 0) {
+	pid_t pid = fork();
+	if (pid == 0) {
 		if(dpy)
 			close(ConnectionNumber(dpy));
 
 		setsid();
-
-		sigemptyset(&sa.sa_mask);
-		sa.sa_flags = 0;
-		sa.sa_handler = SIG_DFL;
-		sigaction(SIGCHLD, &sa, NULL);
-
+		if (sel >= 0 && clients[sel] && clients[sel]->pid > 0 && getpidcwd(getchildpid(clients[sel]->pid), sel_cwd, PATH_MAX) == 0) {
+			chdir(sel_cwd);
+		}
 		if (arg && arg->v) {
 			execvp(((char **)arg->v)[0], (char **)arg->v);
 			fprintf(stderr, "%s: execvp %s", argv0,
@@ -1112,6 +1272,8 @@ spawn(const Arg *arg)
 		}
 		perror(" failed");
 		exit(0);
+	} else {
+		nextpid = pid;
 	}
 }
 
@@ -1219,10 +1381,7 @@ updatenumlockmask(void)
 void
 updatetitle(int c)
 {
-	if (!gettextprop(clients[c]->win, wmatom[WMName], clients[c]->name,
-	    sizeof(clients[c]->name)))
-		gettextprop(clients[c]->win, XA_WM_NAME, clients[c]->name,
-		            sizeof(clients[c]->name));
+	gettextprop(clients[c]->win, XA_WM_NAME, clients[c]->name,sizeof(clients[c]->name));
 	if (sel == c)
 		xsettitle(win, clients[c]->name);
 	drawbar();
@@ -1269,6 +1428,46 @@ xsettitle(Window w, const char *str)
 		XSetTextProperty(dpy, w, &xtp, XA_WM_NAME);
 		XFree(xtp.value);
 	}
+}
+
+void
+xseticon(void)
+{
+	Atom ret_type;
+	XWMHints *wmh, *cwmh;
+	int ret_format;
+	unsigned long ret_nitems, ret_nleft;
+	long offset = 0L;
+	unsigned char *data;
+
+	wmh = XGetWMHints(dpy, win);
+	wmh->flags &= ~(IconPixmapHint | IconMaskHint);
+	wmh->icon_pixmap = wmh->icon_mask = None;
+
+
+	if (XGetWindowProperty(dpy, clients[sel]->win, wmatom[WMIcon], offset, LONG_MAX, False,
+	                       XA_CARDINAL, &ret_type, &ret_format, &ret_nitems,
+	                       &ret_nleft, &data) == Success &&
+	    ret_type == XA_CARDINAL && ret_format == 32)
+	{
+		XChangeProperty(dpy, win, wmatom[WMIcon], XA_CARDINAL, 32,
+		                PropModeReplace, data, ret_nitems);
+	} else if ((cwmh = XGetWMHints(dpy, clients[sel]->win)) && cwmh->flags & IconPixmapHint) {
+		XDeleteProperty(dpy, win, wmatom[WMIcon]);
+		wmh->flags |= IconPixmapHint;
+		wmh->icon_pixmap = cwmh->icon_pixmap;
+		if (cwmh->flags & IconMaskHint) {
+			wmh->flags |= IconMaskHint;
+			wmh->icon_mask = cwmh->icon_mask;
+		}
+		XFree(cwmh);
+	} else {
+		XChangeProperty(dpy, win, wmatom[WMIcon], XA_CARDINAL, 32,
+		                PropModeReplace, (unsigned char *) icon, ICON_WIDTH * ICON_HEIGHT + 2);
+	}
+	XSetWMHints(dpy, win, wmh);
+	XFree(wmh);
+	XFree(data);
 }
 
 void
@@ -1360,6 +1559,7 @@ main(int argc, char *argv[])
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("%s: cannot open display\n", argv0);
 
+	config_init();
 	setup();
 	printf("0x%lx\n", win);
 	fflush(NULL);
